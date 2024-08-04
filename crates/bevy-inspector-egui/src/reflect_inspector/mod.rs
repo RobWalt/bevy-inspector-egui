@@ -69,8 +69,8 @@ use bevy_ecs::world::CommandQueue;
 use bevy_reflect::{std_traits::ReflectDefault, DynamicStruct};
 use bevy_reflect::{
     Array, DynamicEnum, DynamicTuple, DynamicVariant, Enum, EnumInfo, List, ListInfo, Map, Reflect,
-    ReflectMut, ReflectRef, Struct, StructInfo, Tuple, TupleInfo, TupleStruct, TupleStructInfo,
-    TypeInfo, TypeRegistry, ValueInfo, VariantInfo, VariantType,
+    ReflectMut, ReflectRef, Set, Struct, StructInfo, Tuple, TupleInfo, TupleStruct,
+    TupleStructInfo, TypeInfo, TypeRegistry, ValueInfo, VariantInfo, VariantType,
 };
 use egui::{Grid, WidgetText};
 use std::any::{Any, TypeId};
@@ -238,6 +238,7 @@ impl InspectorUi<'_, '_> {
             ReflectMut::List(value) => self.ui_for_list(value, ui, id, options),
             ReflectMut::Array(value) => self.ui_for_array(value, ui, id, options),
             ReflectMut::Map(value) => self.ui_for_reflect_map(value, ui, id, options),
+            ReflectMut::Set(value) => self.ui_for_reflect_set(value, ui, id, options),
             ReflectMut::Enum(value) => self.ui_for_enum(value, ui, id, options),
             ReflectMut::Value(value) => self.ui_for_value(value, ui, id, options),
         }
@@ -286,6 +287,7 @@ impl InspectorUi<'_, '_> {
             ReflectRef::List(value) => self.ui_for_list_readonly(value, ui, id, options),
             ReflectRef::Array(value) => self.ui_for_array_readonly(value, ui, id, options),
             ReflectRef::Map(value) => self.ui_for_reflect_map_readonly(value, ui, id, options),
+            ReflectRef::Set(value) => self.ui_for_reflect_set_readonly(value, ui, id, options),
             ReflectRef::Enum(value) => self.ui_for_enum_readonly(value, ui, id, options),
             ReflectRef::Value(value) => self.ui_for_value_readonly(value, ui, id, options),
         }
@@ -367,6 +369,13 @@ impl InspectorUi<'_, '_> {
                 );
                 false
             }
+            TypeInfo::Set(info) => {
+                errors::no_multiedit(
+                    ui,
+                    &pretty_type_name::pretty_type_name_str(info.type_path()),
+                );
+                false
+            }
             TypeInfo::Enum(info) => self.ui_for_enum_many(info, ui, id, options, values, projector),
             TypeInfo::Value(info) => self.ui_for_value_many(info, ui, id, options),
         }
@@ -429,6 +438,17 @@ impl Clone for MapDraftElement {
     fn clone(&self) -> Self {
         Self {
             key: self.key.clone_value(),
+            value: self.value.clone_value(),
+        }
+    }
+}
+
+struct SetDraftElement {
+    value: Box<dyn Reflect>,
+}
+impl Clone for SetDraftElement {
+    fn clone(&self) -> Self {
+        Self {
             value: self.value.clone_value(),
         }
     }
@@ -1020,6 +1040,103 @@ impl InspectorUi<'_, '_> {
         egui::Grid::new(id).show(ui, |ui| {
             for (i, (key, value)) in map.iter().enumerate() {
                 self.ui_for_reflect_readonly_with_options(key, ui, id.with(i), &());
+                self.ui_for_reflect_readonly_with_options(value, ui, id.with(i), &());
+                ui.end_row();
+            }
+        });
+    }
+
+    fn ui_for_reflect_set(
+        &mut self,
+        set: &mut dyn Set,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        _options: &dyn Any,
+    ) -> bool {
+        let mut changed = false;
+        let set_draft_id = id.with("set_draft");
+        if set.is_empty() {
+            ui.label("(Empty Set)");
+            ui.end_row();
+        }
+        let draft_clone = ui.data_mut(|data| {
+            data.get_temp_mut_or_default::<Option<SetDraftElement>>(set_draft_id)
+                .to_owned()
+        });
+        let mut to_delete: Option<Box<dyn Reflect>> = None;
+
+        egui::Grid::new(id).show(ui, |ui| {
+            for (i, value) in set.iter().enumerate() {
+                self.ui_for_reflect_readonly_with_options(value, ui, id.with(i), &());
+                if remove_button(ui).on_hover_text("Remove element").clicked() {
+                    to_delete = Some(value.clone_value());
+                }
+                ui.end_row();
+            }
+            ui.separator();
+            ui.end_row();
+            ui.label("New element");
+            match draft_clone {
+                None => {
+                    // If no draft element exists, show a button to create one.
+                    if add_button(ui).clicked() {
+                        // Insert a temporary 'draft' key-value pair into UI state.
+                        if let Some(TypeInfo::Set(set_info)) = set.get_represented_type_info() {
+                            let op = self
+                                .get_default_value_for(set_info.value_type_id())
+                                .map(|v| SetDraftElement { value: v });
+                            if op.is_some() {
+                                ui.data_mut(|data| data.insert_temp(set_draft_id, op));
+                            }
+                        }
+                    }
+                    ui.end_row();
+                }
+                Some(SetDraftElement { value: mut v }) => {
+                    ui.end_row();
+                    // Show controls for editing our draft element.
+                    let value_changed = self.ui_for_reflect_with_options(v.as_mut(), ui, id, &());
+                    // If the clone changed, update the data in UI state.
+                    if value_changed {
+                        let next_draft = SetDraftElement { value: v };
+                        ui.data_mut(|data| data.insert_temp(set_draft_id, Some(next_draft)));
+                    }
+                    // Show controls to insert the draft into the map, or remove it.
+                    if ui.button("Insert").clicked() {
+                        let draft = ui
+                            .data_mut(|data| data.get_temp::<Option<SetDraftElement>>(set_draft_id))
+                            .flatten();
+                        if let Some(draft) = draft {
+                            set.insert_boxed(draft.value);
+                            ui.data_mut(|data| data.remove_by_type::<Option<SetDraftElement>>());
+                        }
+                        changed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        ui.data_mut(|data| data.remove_by_type::<Option<SetDraftElement>>());
+                        changed = true;
+                    }
+                    ui.end_row();
+                }
+            }
+        });
+
+        if let Some(value) = to_delete {
+            set.remove(value.as_ref());
+        }
+
+        changed
+    }
+
+    fn ui_for_reflect_set_readonly(
+        &mut self,
+        set: &dyn Set,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        _options: &dyn Any,
+    ) {
+        egui::Grid::new(id).show(ui, |ui| {
+            for (i, value) in set.iter().enumerate() {
                 self.ui_for_reflect_readonly_with_options(value, ui, id.with(i), &());
                 ui.end_row();
             }
